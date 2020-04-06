@@ -26,6 +26,7 @@ const messageSync = 0
 const messageQueryAwareness = 3
 const messageAwareness = 1
 const messageBcPeerId = 4
+const customEvent = 5
 
 /**
  * @type {Map<string, SignalingConn>}
@@ -60,7 +61,7 @@ const checkIsSynced = room => {
  * @param {function} syncedCallback
  * @return {encoding.Encoder?}
  */
-const readMessage = (room, buf, syncedCallback) => {
+const readMessage = (room, buf, syncedCallback, customEventCallback = (...args) => null) => {
   const decoder = decoding.createDecoder(buf)
   const encoder = encoding.createEncoder()
   const messageType = decoding.readVarUint(decoder)
@@ -111,6 +112,12 @@ const readMessage = (room, buf, syncedCallback) => {
         broadcastBcPeerId(room)
       }
       break
+    }
+    case customEvent: {
+      decoding.readVarUint(decoder);
+      const data = decoding.readVarString(decoder);
+      customEventCallback(data, room);
+      break;
     }
     default:
       console.error('Unable to compute message')
@@ -285,13 +292,17 @@ const broadcastBcPeerId = room => {
 }
 
 export class Room {
+  static get rooms() {
+    return rooms;
+  }
+
   /**
    * @param {Y.Doc} doc
    * @param {WebrtcProvider} provider
    * @param {string} name
    * @param {CryptoKey|null} key
    */
-  constructor (doc, provider, name, key) {
+  constructor (doc, provider, name, key, customEventCallback = (...args) => null) {
     /**
      * Do not assume that peerId is unique. This is only meant for sending signaling messages.
      *
@@ -324,7 +335,7 @@ export class Room {
     this._bcSubscriber = data =>
       cryptoutils.decrypt(new Uint8Array(data), key).then(m =>
         this.mux(() => {
-          const reply = readMessage(this, m, () => {})
+          const reply = readMessage(this, m, () => {}, customEventCallback)
           if (reply) {
             broadcastBcMessage(this, encoding.toUint8Array(reply))
           }
@@ -365,6 +376,16 @@ export class Room {
         room.disconnect()
       })
     })
+  }
+  sendCustomEvent(data) {
+    const encoder = encoding.createEncoder();
+    const payload = encoding.createEncoder();
+    encoding.writeVarString(payload, data);
+
+    encoding.writeVarUint(encoder, customEvent);
+    encoding.writeVarUint8Array(encoder, encoding.toUint8Array(payload));
+
+    broadcastRoomMessage(this, encoding.toUint8Array(encoder));
   }
   connect () {
     // signal through all available signaling connections
@@ -427,12 +448,12 @@ export class Room {
  * @param {CryptoKey|null} key
  * @return {Room}
  */
-const openRoom = (doc, provider, name, key) => {
+const openRoom = (doc, provider, name, key, customEventCallback) => {
   // there must only be one room
   if (rooms.has(name)) {
     throw error.create(`A Yjs Doc connected to room "${name}" already exists!`)
   }
-  const room = new Room(doc, provider, name, key)
+  const room = new Room(doc, provider, name, key, customEventCallback)
   rooms.set(name, /** @type {Room} */ (room))
   return room
 }
@@ -488,7 +509,7 @@ export class SignalingConn extends ws.WebsocketClient {
                 added: [data.from],
                 webrtcPeers: Array.from(room.webrtcConns.keys()),
                 bcPeers: Array.from(room.bcConns)
-              }])
+              }]);
             switch (data.type) {
               case 'announce':
                 if (webrtcConns.size < room.provider.maxConns) {
@@ -531,6 +552,7 @@ export class WebrtcProvider extends Observable {
    * @param {awarenessProtocol.Awareness} [opts.awareness]
    * @param {number} [opts.maxConns]
    * @param {boolean} [opts.filterBcConns]
+   * @param {Function} [opts.customEventCallback]
    */
   constructor (
     roomName,
@@ -540,7 +562,8 @@ export class WebrtcProvider extends Observable {
       password = null,
       awareness = new awarenessProtocol.Awareness(doc),
       maxConns = 20 + math.floor(random.rand() * 15), // just to prevent that exactly n clients form a cluster
-      filterBcConns = true
+      filterBcConns = true,
+      customEventCallback = (...args) => null
     } = {}
   ) {
     super()
@@ -564,7 +587,7 @@ export class WebrtcProvider extends Observable {
      */
     this.room = null
     this.key.then(key => {
-      this.room = openRoom(doc, this, roomName, key)
+      this.room = openRoom(doc, this, roomName, key, customEventCallback)
       if (this.shouldConnect) {
         this.room.connect()
       } else {
